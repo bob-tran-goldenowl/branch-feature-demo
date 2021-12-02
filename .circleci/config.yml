@@ -1,0 +1,174 @@
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@1.3.1
+  
+job_config_defaults: &job_config_defaults
+  working_directory: ~/repo
+  docker:
+    - image: circleci/node:14.15
+  resource_class: large
+
+# define our branch filters
+filter_on_feature: &filter_on_feature
+  filters:
+    branches:
+      ignore:
+        - development
+        - main
+    tags:
+      ignore: /.*/
+
+filter_on_all: &filter_on_all
+  filters:
+    branches:
+      only: /.*/
+    tags:
+      ignore: /.*/
+
+filter_on_main: &filter_on_main
+  filters:
+    branches:
+      only: main
+    tags:
+      ignore: /.*/
+
+filter_on_staging: &filter_on_staging
+  filters:
+    branches:
+      only: development
+    tags:
+      ignore: /.*/
+
+
+jobs:
+  checkout_code:
+    <<: *job_config_defaults
+    steps:
+      - restore_cache:
+          keys:
+            - source-{{ .Branch }}-{{ .Revision }}
+      - checkout
+      - save_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - ~/repo
+  install:
+    <<: *job_config_defaults
+    steps:
+      - restore_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+      - run:
+          name: 'Yarn install'
+          command: yarn install
+      - save_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - node_modules
+      - persist_to_workspace:
+          root: ~/repo
+          paths:
+            - node_modules
+  test:
+    <<: *job_config_defaults
+    steps:
+      - restore_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+      - run:
+          name: 'Test'
+          command: yarn test:ci
+  build:
+    <<: *job_config_defaults
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - run:
+          name: 'Set PATH_PREFIX'
+          command: |
+            if [ "${CIRCLE_BRANCH}" != "main" ] && [ "${CIRCLE_BRANCH}" != "development" ]; then
+              echo 'export PATH_PREFIX="${CIRCLE_BRANCH}"' >> $BASH_ENV
+              echo 'export PREFIX_PATHS=true' >> $BASH_ENV
+            fi
+      - restore_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+      - run:
+          name: 'Build app'
+          command: NODE_ENV=${NODE_ENV} yarn build
+      - persist_to_workspace:
+          root: ~/repo
+          paths:
+            - public
+            - package.json
+  deploy:
+    <<: *job_config_defaults
+    executor: aws-cli/default
+    steps:
+      - attach_workspace:
+          at: ~/repo
+      - aws-cli/setup:
+          profile-name: circleci
+      - run: aws --version
+      - run: aws s3 ls
+      - run:
+          name: 'Deploy to S3'
+          command: |
+            env | sort
+            echo $PATH_PREFIX
+            if [ "${CIRCLE_BRANCH}" == "main" ]; then
+              aws s3 sync --cache-control 'max-age=604800' --exclude index.html public/ s3://${PRODUCTION_S3_BUCKET} --delete
+              aws s3 sync --cache-control 'max-age=0' public/ s3://${PRODUCTION_S3_BUCKET} --delete
+            elif [ "${CIRCLE_BRANCH}" == "development" ]; then
+              aws s3 sync --cache-control 'max-age=604800' --exclude index.html public/ s3://${STAGING_S3_BUCKET} --delete
+              aws s3 sync --cache-control 'max-age=0' public/ s3://${STAGING_S3_BUCKET} --delete
+            elif [ "${CIRCLE_BRANCH}" != "main" ] && [ "${CIRCLE_BRANCH}" != "development" ]; then
+              aws s3 sync --cache-control 'max-age=604800' public/ s3://${STAGING_S3_BUCKET}/${CIRCLE_BRANCH}/ --delete
+              aws s3 sync --cache-control 'max-age=0' public/ s3://${STAGING_S3_BUCKET}/${CIRCLE_BRANCH}/ --delete
+            fi
+workflows:
+  version: 2
+  build-and-deploy:
+    jobs:
+      - checkout_code:
+          <<: *filter_on_all
+      - install:
+          <<: *filter_on_all
+          requires:
+            - checkout_code
+      - build:
+          name: build feature
+          <<: *filter_on_feature
+          requires:
+            - install
+      - build:
+          name: build staging
+          <<: *filter_on_staging
+          requires:
+            - install
+      - build:
+          name: build main
+          <<: *filter_on_main
+          requires:
+            - install
+      - deploy:
+          name: deploy feature
+          <<: *filter_on_feature
+          context:
+            - ctx-frontend-deployer-aws
+            - ctx-staging-branch-feature
+          requires:
+            - build feature      
+      - deploy:
+          name: deploy staging
+          <<: *filter_on_staging
+          context:
+            - ctx-frontend-deployer-aws
+            - ctx-staging-branch-feature
+          requires:
+            - build staging
+      - deploy:
+          name: deploy main
+          <<: *filter_on_main
+          context:
+            - ctx-frontend-deployer-aws
+            - ctx-production-branch-feature
+          requires:
+            - build main
