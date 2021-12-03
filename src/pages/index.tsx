@@ -20,6 +20,10 @@ export const Routes : Record<string,IRoute> ={
   feat1: {
     path: '/feat-one',
     title: 'Go back to the feat one',
+  },
+  feat3: {
+    path: '/feat-three',
+    title: 'Go back to the feat one',
   }
 }
 
